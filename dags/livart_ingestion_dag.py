@@ -2,6 +2,7 @@
 Livart 시장 데이터 수집 → Postgres(dbt) raw 적재 (ADF Copy Activity 유사 패턴)
 """
 from __future__ import annotations
+from airflow.operators.bash import BashOperator
 
 from datetime import datetime
 from typing import Final
@@ -119,7 +120,15 @@ def livart_ingestion_pipeline():
         )
         return len(combined)
 
-    extract_load_market_data()
+    extract_task = extract_load_market_data()
+
+    run_dbt_models = BashOperator(
+        task_id="run_dbt_models",
+        bash_command="dbt run --project-dir /opt/airflow/dbt_project --profiles-dir /opt/airflow/dbt_project",
+    )
+    
+    extract_task >> run_dbt_models
+    
 
 
 livart_ingestion_pipeline()

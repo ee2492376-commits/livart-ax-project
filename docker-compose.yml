@@ -15,11 +15,12 @@ x-airflow-common: &airflow-common
     AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
     AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: "true"
     # 컨테이너 내 고정 경로 (호스트 ./dbt, ./data 와 마운트 연동)
-    DBT_PROJECT_DIR: /opt/airflow/dbt
+    DBT_PROJECT_DIR: /opt/airflow/dbt_project
     DATA_DIR: /opt/airflow/data
   volumes:
     - ./dags:/opt/airflow/dags
     - ./dbt:/opt/airflow/dbt
+    - ./dbt_project:/opt/airflow/dbt_project
     - ./data:/opt/airflow/data
     - ./logs:/opt/airflow/logs
   user: "${AIRFLOW_UID:-50000}:0"
