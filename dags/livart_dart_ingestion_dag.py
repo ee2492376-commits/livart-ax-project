@@ -12,9 +12,10 @@ import zipfile
 from airflow.decorators import dag, task
 from sqlalchemy import create_engine, text
 
-DART_API_KEY = os.getenv("DART_API_KEY", "")
+DART_API_KEY = os.getenv("DART_API_KEY", "bb8a84b56787b80cbde595387d2f0263c691e7d3")
 TARGET_STOCK_CODE = "079430"  # 현대리바트
 DB_URL = "postgresql+psycopg2://airflow:airflow@postgres:5432/dbt"
+FS_DIV = os.getenv("DART_FS_DIV", "CFS").upper()  # CFS: 연결 / OFS: 별도
 
 
 def _http_get_json(url: str) -> dict:
@@ -49,96 +50,150 @@ def _get_corp_code_by_stock(stock_code: str, api_key: str) -> tuple[str, str]:
     raise ValueError(f"stock_code={stock_code} 에 해당하는 corp_code를 찾지 못했습니다.")
 
 
-def _fetch_quarterly_reports(corp_code: str, api_key: str, bgn_de: str, end_de: str) -> list[dict]:
+def _fetch_single_account(
+    corp_code: str,
+    api_key: str,
+    bsns_year: str,
+    reprt_code: str = "11011",  # 사업보고서
+    fs_div: str = "CFS",        # 연결재무제표(CFS) / 별도재무제표(OFS)
+) -> list[dict]:
     """
-    DART list.json에서 분기보고서(A003) 목록 페이징 조회
+    DART fnlttSinglAcnt.json에서 단일회사 주요계정 조회
     """
-    all_items: list[dict] = []
-    page_no = 1
-    page_count = 100
+    params = {
+        "crtfc_key": api_key,
+        "corp_code": corp_code,
+        "bsns_year": bsns_year,
+        "reprt_code": reprt_code,
+        "fs_div": fs_div,
+    }
+    url = "https://opendart.fss.or.kr/api/fnlttSinglAcnt.json?" + urllib.parse.urlencode(params)
+    data = _http_get_json(url)
+    status = data.get("status")
+    if status == "013":
+        return []
+    if status != "000":
+        raise RuntimeError(f"fnlttSinglAcnt API 오류: status={status}, message={data.get('message')}")
+    return data.get("list", [])
 
-    while True:
-        params = {
-            "crtfc_key": api_key,
-            "corp_code": corp_code,
-            "bgn_de": bgn_de,
-            "end_de": end_de,
-            "pblntf_ty": "A",          # 정기공시
-            "pblntf_detail_ty": "A003", # 분기보고서
-            "page_no": str(page_no),
-            "page_count": str(page_count),
-        }
-        url = "https://opendart.fss.or.kr/api/list.json?" + urllib.parse.urlencode(params)
-        data = _http_get_json(url)
 
-        status = data.get("status")
-        if status == "013":  # 조회된 데이터 없음
-            break
-        if status != "000":
-            raise RuntimeError(f"DART API 오류: status={status}, message={data.get('message')}")
+def _to_statement_type(sj_nm: str) -> str | None:
+    if "포괄손익계산서" in sj_nm:
+        return "포괄손익계산서"
+    if "손익계산서" in sj_nm:
+        return "손익계산서"
+    return None
 
-        items = data.get("list", [])
-        all_items.extend(items)
 
-        total_count = int(data.get("total_count", 0))
-        if page_no * page_count >= total_count:
-            break
-        page_no += 1
-
-    return all_items
+def _to_amount(raw: str | None) -> int | None:
+    amount_text = (raw or "").replace(",", "").strip()
+    if not amount_text or amount_text == "-":
+        return None
+    try:
+        return int(amount_text)
+    except ValueError:
+        return None
 
 
 @dag(
-    dag_id="livart_dart_quarterly_ingestion",
+    dag_id="livart_dart_financial_ingestion",
     start_date=datetime(2025, 1, 1),
     schedule=None,   # 수동 실행 (원하면 cron으로 변경)
     catchup=False,
     tags=["dart", "livart", "ingestion"],
 )
-def livart_dart_quarterly_ingestion():
-    @task(task_id="fetch_and_load_dart_quarterly")
-    def fetch_and_load_dart_quarterly() -> int:
-        # 최근 넉넉히 5년 조회
-        bgn_de = "20200101"
-        end_de = datetime.now().strftime("%Y%m%d")
-
+def livart_dart_financial_ingestion():
+    @task(task_id="fetch_and_load_dart_financial")
+    def fetch_and_load_dart_financial() -> int:
         corp_code, corp_name = _get_corp_code_by_stock(TARGET_STOCK_CODE, DART_API_KEY)
-        reports = _fetch_quarterly_reports(corp_code, DART_API_KEY, bgn_de, end_de)
+        bsns_year = datetime.now().strftime("%Y")
+
+        single_accounts = _fetch_single_account(
+            corp_code=corp_code,
+            api_key=DART_API_KEY,
+            bsns_year=bsns_year,
+            reprt_code="11011",
+            fs_div=FS_DIV,
+        )
+
+        # 해당 연도 데이터 없으면 전년도 fallback
+        if not single_accounts:
+            bsns_year = str(int(bsns_year) - 1)
+            single_accounts = _fetch_single_account(
+                corp_code=corp_code,
+                api_key=DART_API_KEY,
+                bsns_year=bsns_year,
+                reprt_code="11011",
+                fs_div=FS_DIV,
+            )
+
+        # 응답 재필터: API가 간헐적으로 다른 fs_div를 섞어 줄 수 있어 강제 필터
+        single_accounts = [
+            r for r in single_accounts if (r.get("fs_div") or "").upper() == FS_DIV
+        ]
+
+        rows: list[dict] = []
+        for item in single_accounts:
+            statement_type = _to_statement_type((item.get("sj_nm") or "").strip())
+            if statement_type is None:
+                continue
+            rows.append(
+                {
+                    "year": item.get("bsns_year", bsns_year),
+                    "corp_code": item.get("corp_code", corp_code),
+                    "corp_name": corp_name,
+                    "account_nm": (item.get("account_nm") or "").strip(),
+                    "amount": _to_amount(item.get("thstrm_amount")),
+                    "statement_type": statement_type,
+                    "fs_div": (item.get("fs_div") or FS_DIV).upper(),
+                }
+            )
+
+        dedup_keys = (
+            "year",
+            "corp_code",
+            "corp_name",
+            "account_nm",
+            "amount",
+            "statement_type",
+            "fs_div",
+        )
+        unique_rows = list(
+            {
+                tuple(row[key] for key in dedup_keys): row
+                for row in rows
+            }.values()
+        )
 
         engine = create_engine(DB_URL, pool_pre_ping=True)
 
         create_sql = text(
             """
-            CREATE TABLE IF NOT EXISTS raw_dart_quarterly_reports (
-                rcept_no        VARCHAR(14) PRIMARY KEY,
-                corp_code       VARCHAR(8)  NOT NULL,
-                corp_name       VARCHAR(255),
-                stock_code      VARCHAR(6),
-                report_nm       VARCHAR(255),
-                rcept_dt        DATE,
-                flr_nm          VARCHAR(255),
-                rm              TEXT,
-                loaded_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            CREATE TABLE IF NOT EXISTS raw_dart_financial_accounts (
+                year            VARCHAR(4)   NOT NULL,
+                corp_code       VARCHAR(8)   NOT NULL,
+                corp_name       VARCHAR(255) NOT NULL,
+                account_nm      VARCHAR(255) NOT NULL,
+                amount          BIGINT,
+                statement_type  VARCHAR(50)  NOT NULL,
+                fs_div          VARCHAR(4)   NOT NULL,
+                loaded_at       TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (year, corp_code, account_nm, statement_type, fs_div)
             );
             """
         )
 
         upsert_sql = text(
             """
-            INSERT INTO raw_dart_quarterly_reports (
-                rcept_no, corp_code, corp_name, stock_code, report_nm, rcept_dt, flr_nm, rm
+            INSERT INTO raw_dart_financial_accounts (
+                year, corp_code, corp_name, account_nm, amount, statement_type, fs_div
             ) VALUES (
-                :rcept_no, :corp_code, :corp_name, :stock_code, :report_nm, :rcept_dt, :flr_nm, :rm
+                :year, :corp_code, :corp_name, :account_nm, :amount, :statement_type, :fs_div
             )
-            ON CONFLICT (rcept_no)
+            ON CONFLICT (year, corp_code, account_nm, statement_type, fs_div)
             DO UPDATE SET
-                corp_code = EXCLUDED.corp_code,
                 corp_name = EXCLUDED.corp_name,
-                stock_code = EXCLUDED.stock_code,
-                report_nm = EXCLUDED.report_nm,
-                rcept_dt = EXCLUDED.rcept_dt,
-                flr_nm = EXCLUDED.flr_nm,
-                rm = EXCLUDED.rm,
+                amount = EXCLUDED.amount,
                 loaded_at = NOW();
             """
         )
@@ -146,24 +201,12 @@ def livart_dart_quarterly_ingestion():
         with engine.begin() as conn:
             conn.execute(create_sql)
 
-            for item in reports:
-                conn.execute(
-                    upsert_sql,
-                    {
-                        "rcept_no": item.get("rcept_no"),
-                        "corp_code": item.get("corp_code", corp_code),
-                        "corp_name": item.get("corp_name", corp_name),
-                        "stock_code": item.get("stock_code", TARGET_STOCK_CODE),
-                        "report_nm": item.get("report_nm"),
-                        "rcept_dt": item.get("rcept_dt"),  # YYYYMMDD 문자열도 Postgres DATE로 캐스팅됨
-                        "flr_nm": item.get("flr_nm"),
-                        "rm": item.get("rm"),
-                    },
-                )
+            for row in unique_rows:
+                conn.execute(upsert_sql, row)
 
-        return len(reports)
+        return len(unique_rows)
 
-    fetch_and_load_dart_quarterly()
+    fetch_and_load_dart_financial()
 
 
-livart_dart_quarterly_ingestion()
+livart_dart_financial_ingestion()
