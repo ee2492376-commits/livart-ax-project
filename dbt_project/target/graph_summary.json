@@ -1,1 +1,1 @@
-{"_invocation_id": "73f25aff-e971-4b1f-95ed-e7cb8f9dc868", "linked": {"0": {"name": "model.livart_dbt.mart_livart_analysis", "type": "model"}, "1": {"name": "model.livart_dbt.stg_market_data", "type": "model", "succ": [0]}}}
+{"_invocation_id": "74369204-c816-4087-aa3e-4ca279e61612", "linked": {"0": {"name": "model.livart_dbt.mart_livart_analysis", "type": "model"}, "1": {"name": "model.livart_dbt.stg_market_data", "type": "model", "succ": [0]}, "2": {"name": "model.livart_dbt.stg_dart_financials", "type": "model"}}}
