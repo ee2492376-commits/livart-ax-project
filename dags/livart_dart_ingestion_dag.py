@@ -1,4 +1,7 @@
 from __future__ import annotations
+from airflow.decorators import dag, task
+from sqlalchemy import create_engine, text
+from airflow.operators.bash import BashOperator
 
 from datetime import datetime
 import io
@@ -16,6 +19,12 @@ DART_API_KEY = os.getenv("DART_API_KEY", "bb8a84b56787b80cbde595387d2f0263c691e7
 TARGET_STOCK_CODE = "079430"  # 현대리바트
 DB_URL = "postgresql+psycopg2://airflow:airflow@postgres:5432/dbt"
 FS_DIV = os.getenv("DART_FS_DIV", "CFS").upper()  # CFS: 연결 / OFS: 별도
+REPORT_TYPE_MAP = {
+    "11011": "annual",  # 사업보고서
+    "11012": "half",    # 반기보고서
+    "11013": "q1",      # 1분기보고서
+    "11014": "q3",      # 3분기보고서
+}
 
 
 def _http_get_json(url: str) -> dict:
@@ -107,25 +116,37 @@ def livart_dart_financial_ingestion():
     def fetch_and_load_dart_financial() -> int:
         corp_code, corp_name = _get_corp_code_by_stock(TARGET_STOCK_CODE, DART_API_KEY)
         bsns_year = datetime.now().strftime("%Y")
+        reprt_codes = ("11011", "11012", "11013", "11014")
+        single_accounts: list[dict] = []
 
-        single_accounts = _fetch_single_account(
-            corp_code=corp_code,
-            api_key=DART_API_KEY,
-            bsns_year=bsns_year,
-            reprt_code="11011",
-            fs_div=FS_DIV,
-        )
+        for reprt_code in reprt_codes:
+            fetched = _fetch_single_account(
+                corp_code=corp_code,
+                api_key=DART_API_KEY,
+                bsns_year=bsns_year,
+                reprt_code=reprt_code,
+                fs_div=FS_DIV,
+            )
+            for item in fetched:
+                item["reprt_code"] = reprt_code
+                item["report_type"] = REPORT_TYPE_MAP.get(reprt_code, "unknown")
+            single_accounts.extend(fetched)
 
         # 해당 연도 데이터 없으면 전년도 fallback
         if not single_accounts:
             bsns_year = str(int(bsns_year) - 1)
-            single_accounts = _fetch_single_account(
-                corp_code=corp_code,
-                api_key=DART_API_KEY,
-                bsns_year=bsns_year,
-                reprt_code="11011",
-                fs_div=FS_DIV,
-            )
+            for reprt_code in reprt_codes:
+                fetched = _fetch_single_account(
+                    corp_code=corp_code,
+                    api_key=DART_API_KEY,
+                    bsns_year=bsns_year,
+                    reprt_code=reprt_code,
+                    fs_div=FS_DIV,
+                )
+                for item in fetched:
+                    item["reprt_code"] = reprt_code
+                    item["report_type"] = REPORT_TYPE_MAP.get(reprt_code, "unknown")
+                single_accounts.extend(fetched)
 
         # 응답 재필터: API가 간헐적으로 다른 fs_div를 섞어 줄 수 있어 강제 필터
         single_accounts = [
@@ -140,6 +161,8 @@ def livart_dart_financial_ingestion():
             rows.append(
                 {
                     "year": item.get("bsns_year", bsns_year),
+                    "reprt_code": item.get("reprt_code", "11011"),
+                    "report_type": item.get("report_type", "annual"),
                     "corp_code": item.get("corp_code", corp_code),
                     "corp_name": corp_name,
                     "account_nm": (item.get("account_nm") or "").strip(),
@@ -151,6 +174,8 @@ def livart_dart_financial_ingestion():
 
         dedup_keys = (
             "year",
+            "reprt_code",
+            "report_type",
             "corp_code",
             "corp_name",
             "account_nm",
@@ -171,6 +196,8 @@ def livart_dart_financial_ingestion():
             """
             CREATE TABLE IF NOT EXISTS raw_dart_financial_accounts (
                 year            VARCHAR(4)   NOT NULL,
+                reprt_code      VARCHAR(5)   NOT NULL,
+                report_type     VARCHAR(10)  NOT NULL,
                 corp_code       VARCHAR(8)   NOT NULL,
                 corp_name       VARCHAR(255) NOT NULL,
                 account_nm      VARCHAR(255) NOT NULL,
@@ -178,7 +205,7 @@ def livart_dart_financial_ingestion():
                 statement_type  VARCHAR(50)  NOT NULL,
                 fs_div          VARCHAR(4)   NOT NULL,
                 loaded_at       TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
-                PRIMARY KEY (year, corp_code, account_nm, statement_type, fs_div)
+                PRIMARY KEY (year, reprt_code, corp_code, account_nm, statement_type, fs_div)
             );
             """
         )
@@ -186,12 +213,13 @@ def livart_dart_financial_ingestion():
         upsert_sql = text(
             """
             INSERT INTO raw_dart_financial_accounts (
-                year, corp_code, corp_name, account_nm, amount, statement_type, fs_div
+                year, reprt_code, report_type, corp_code, corp_name, account_nm, amount, statement_type, fs_div
             ) VALUES (
-                :year, :corp_code, :corp_name, :account_nm, :amount, :statement_type, :fs_div
+                :year, :reprt_code, :report_type, :corp_code, :corp_name, :account_nm, :amount, :statement_type, :fs_div
             )
-            ON CONFLICT (year, corp_code, account_nm, statement_type, fs_div)
+            ON CONFLICT (year, reprt_code, corp_code, account_nm, statement_type, fs_div)
             DO UPDATE SET
+                report_type = EXCLUDED.report_type,
                 corp_name = EXCLUDED.corp_name,
                 amount = EXCLUDED.amount,
                 loaded_at = NOW();
@@ -206,7 +234,21 @@ def livart_dart_financial_ingestion():
 
         return len(unique_rows)
 
-    fetch_and_load_dart_financial()
+    fetch_task = fetch_and_load_dart_financial()
+
+    run_dbt_models = BashOperator(
+        task_id="run_dbt_models",
+        bash_command=(
+            "dbt run "
+            "--select stg_dart_financials mart_dart_financials mart_livart_features "
+            "--project-dir /opt/airflow/dbt_project "
+            "--profiles-dir /opt/airflow/dbt_project"
+        ),
+    )
+    
+    fetch_task >> run_dbt_models
+
+
 
 
 livart_dart_financial_ingestion()
