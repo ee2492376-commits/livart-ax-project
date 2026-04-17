@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Livart AX Dashboard</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <main class="container">
+    <header class="hero">
+      <h1>Livart AX Dashboard</h1>
+      <p>수집(Airflow) -> 가공(dbt) -> 시각화(Node.js) 통합 대시보드</p>
+    </header>
+
+    <section class="insight">
+      <h2>AI 전략 인사이트</h2>
+      <h3><%= latestReport.title %></h3>
+      <p class="meta">기준일: <%= latestReport.report_date || '-' %></p>
+      <p><strong>요약:</strong> <%= latestReport.summary %></p>
+      <p><strong>추천:</strong> <%= latestReport.recommendation %></p>
+    </section>
+
+    <section class="chart-card">
+      <h2>현대리바트 주가와 환율 상관 흐름</h2>
+      <canvas id="marketChart"></canvas>
+    </section>
+  </main>
+
+  <script>
+    const rows = <%- JSON.stringify(marketData || []) %>;
+    const labels = rows.map((r) => r.trade_date);
+    const price = rows.map((r) => Number(r.livart_close));
+    const fx = rows.map((r) => Number(r.usdkrw_close));
+
+    new Chart(document.getElementById('marketChart'), {
+      type: 'line',
+      data: {
+        labels,
+        datasets: [
+          {
+            label: '현대리바트 종가',
+            data: price,
+            borderColor: '#102a62',
+            backgroundColor: 'rgba(16, 42, 98, 0.12)',
+            yAxisID: 'y',
+            tension: 0.2,
+            pointRadius: 1.2,
+            borderWidth: 2,
+          },
+          {
+            label: 'USD/KRW 환율',
+            data: fx,
+            borderColor: '#1f5fd6',
+            backgroundColor: 'rgba(31, 95, 214, 0.08)',
+            yAxisID: 'y1',
+            tension: 0.2,
+            pointRadius: 1.2,
+            borderWidth: 2,
+          },
+        ],
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        interaction: { mode: 'index', intersect: false },
+        scales: {
+          y: { position: 'left', title: { display: true, text: '주가' } },
+          y1: {
+            position: 'right',
+            title: { display: true, text: '환율' },
+            grid: { drawOnChartArea: false },
+          },
+        },
+      },
+    });
+  </script>
+</body>
+</html>

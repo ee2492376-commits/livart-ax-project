@@ -1,1 +1,1 @@
-{"_invocation_id": "050c3dde-3176-4c17-a55e-ef67a6299b9f", "linked": {"0": {"name": "model.livart_dbt.mart_livart_analysis", "type": "model"}, "1": {"name": "model.livart_dbt.stg_market_data", "type": "model", "succ": [0]}}}
+{"_invocation_id": "73f25aff-e971-4b1f-95ed-e7cb8f9dc868", "linked": {"0": {"name": "model.livart_dbt.mart_livart_analysis", "type": "model"}, "1": {"name": "model.livart_dbt.stg_market_data", "type": "model", "succ": [0]}}}

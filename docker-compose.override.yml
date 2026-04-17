@@ -1,0 +1,19 @@
+services:
+  livart-web:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: livart-web
+    environment:
+      PORT: 3000
+      PGHOST: postgres
+      PGPORT: 5432
+      PGDATABASE: dbt
+      PGUSER: airflow
+      PGPASSWORD: airflow
+    ports:
+      - "3000:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
